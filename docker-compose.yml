@@ -1,0 +1,35 @@
+version: "3.8"
+
+services:
+  step-assembler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: step-assembler
+    ports:
+      - "5001:5001"
+    volumes:
+      # Output folder for generated assembly files
+      - ./output:/app/output
+      # Uploads folder for temporary STP files (auto-cleaned after processing)
+      - ./uploads:/app/uploads
+    environment:
+      - PYTHONUNBUFFERED=1
+      - FLASK_ENV=production
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - assembler-network
+
+networks:
+  assembler-network:
+    driver: bridge
+
+volumes:
+  output:
+  uploads:
