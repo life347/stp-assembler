@@ -22,10 +22,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
 COPY stp_assembler.py /app/
+COPY stp_to_dxf_converter.py /app/
 COPY server.py /app/
 
 # Make scripts executable
-RUN chmod +x /app/stp_assembler.py /app/server.py
+RUN chmod +x /app/stp_assembler.py /app/stp_to_dxf_converter.py /app/server.py
 
 # Create directories for output and uploads
 RUN mkdir -p /app/output /app/uploads
