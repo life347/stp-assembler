@@ -3,7 +3,7 @@
 Flask server for STEP assembly using build123d
 Exposes REST API endpoint for assembling STEP files with transformations
 Accepts uploaded STEP files for remote server deployment
-Also provides STP to DXF conversion
+Also provides STP to DXF conversion and DXF merging
 https://github.com/gumyr/build123d
 """
 
@@ -17,6 +17,7 @@ from flask import Flask, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 from stp_assembler import STEPAssembler
 from stp_to_dxf_converter import STPtoDXFConverter
+from dxf_assembler import DXFAssembler
 
 app = Flask(__name__)
 
@@ -498,12 +499,156 @@ def convert_assembly_to_dxf():
         }), 500
 
 
+@app.route('/merge-dxf', methods=['POST'])
+def merge_dxf_files():
+    """
+    Merge multiple DXF files into a single DXF assembly with proper positioning
+    Uses assembly positions (like STEP assembly) to position components
+    
+    IMPORTANT: Products are processed in the order provided (sequence matters for assembly)
+    
+    Request:
+        - Method: POST
+        - Content-Type: multipart/form-data
+        - Body:
+            - assemblyData: JSON string with products array (position info) and fileName
+            - files: Multiple DXF files (field name: "dxf_<productId>")
+        
+    Response:
+        - Success: Returns merged DXF file
+        - Error: Returns JSON with error message
+    """
+    # Create a unique session folder for this request
+    session_id = str(uuid.uuid4())
+    session_folder = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
+    os.makedirs(session_folder, exist_ok=True)
+    
+    try:
+        # Parse assembly data from form
+        assembly_data_str = request.form.get('assemblyData')
+        if not assembly_data_str:
+            return jsonify({
+                'error': 'No assembly data provided',
+                'message': 'Please provide assemblyData field with products array'
+            }), 400
+        
+        try:
+            assembly_data = json.loads(assembly_data_str)
+        except json.JSONDecodeError as e:
+            return jsonify({
+                'error': 'Invalid JSON in assemblyData',
+                'message': str(e)
+            }), 400
+        
+        products = assembly_data.get('products', [])
+        file_name = assembly_data.get('fileName', 'Assembly')
+        
+        if not products or not isinstance(products, list):
+            return jsonify({
+                'error': 'No products provided',
+                'message': 'Please provide an array of products to merge'
+            }), 400
+        
+        print(f"Merging {len(products)} DXF files into assembly")
+        print(f"Session folder: {session_folder}")
+        
+        # Save uploaded DXF files to session folder
+        uploaded_files = []
+        for key in request.files:
+            if key.startswith('dxf_'):
+                file = request.files[key]
+                product_id = key[4:]  # Remove 'dxf_' prefix
+                filename = secure_filename(f"{product_id}.dxf")
+                file_path = os.path.join(session_folder, filename)
+                file.save(file_path)
+                uploaded_files.append(product_id)
+                print(f"Saved uploaded DXF file: {filename}")
+        
+        print(f"Uploaded {len(uploaded_files)} DXF files")
+        
+        # Check that all required DXF files exist in session folder
+        missing_files = []
+        for product in products:
+            product_id = product.get('productId', '')
+            dxf_path = os.path.join(session_folder, f"{product_id}.dxf")
+            if not os.path.exists(dxf_path):
+                missing_files.append(product_id)
+        
+        if missing_files:
+            return jsonify({
+                'error': 'Missing DXF files',
+                'message': f'DXF files not uploaded for products: {", ".join(missing_files)}',
+                'missingProducts': missing_files
+            }), 400
+        
+        # Output file path
+        output_path = os.path.join(session_folder, f"{file_name}.dxf")
+        
+        # Use DXFAssembler to create the assembly
+        # Products are processed in the order provided (sequence matters!)
+        assembler = DXFAssembler(session_folder, output_path)
+        assembler.load_assembly_data(products)
+        success = assembler.assemble()
+        
+        if not success:
+            return jsonify({
+                'error': 'Assembly failed',
+                'message': 'Failed to create DXF assembly from provided products'
+            }), 500
+        
+        # Verify output file was created
+        if not os.path.exists(output_path):
+            return jsonify({
+                'error': 'Output file not created',
+                'message': 'DXF merge completed but output file was not generated'
+            }), 500
+        
+        output_size = os.path.getsize(output_path)
+        print(f"DXF assembly complete! Output size: {output_size:,} bytes")
+        
+        # Return the merged DXF file
+        response = send_file(
+            output_path,
+            mimetype='application/dxf',
+            as_attachment=True,
+            download_name=f"{file_name}.dxf"
+        )
+        
+        # Schedule cleanup after sending
+        @response.call_on_close
+        def cleanup():
+            try:
+                if os.path.exists(session_folder):
+                    shutil.rmtree(session_folder)
+                    print(f"Cleaned up session folder: {session_folder}")
+            except Exception as e:
+                print(f"Warning: Could not remove session folder: {e}")
+        
+        return response
+        
+    except Exception as e:
+        print(f"Error during DXF merge: {str(e)}")
+        traceback.print_exc()
+        
+        # Clean up session folder on error
+        try:
+            if os.path.exists(session_folder):
+                shutil.rmtree(session_folder)
+        except:
+            pass
+        
+        return jsonify({
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+
 @app.route('/', methods=['GET'])
 def index():
     """Root endpoint with API information"""
     return jsonify({
         'service': 'STEP Assembler API',
-        'version': '2.1.0',
+        'version': '2.2.0',
         'library': 'build123d (https://github.com/gumyr/build123d)',
         'endpoints': {
             'POST /assemble': {
@@ -535,6 +680,15 @@ def index():
                 },
                 'response': 'ZIP file containing STEP assembly and DXF file'
             },
+            'POST /merge-dxf': {
+                'description': 'Merge multiple DXF files into a single assembly with proper positioning',
+                'content_type': 'multipart/form-data',
+                'parameters': {
+                    'assemblyData': 'JSON string with products array (with positions in meters) and fileName',
+                    'dxf_<productId>': 'DXF file for each product (e.g., dxf_382090006301)'
+                },
+                'response': 'Merged DXF file with components positioned according to assembly data'
+            },
             'GET /health': {
                 'description': 'Health check endpoint',
                 'response': 'Service status'
@@ -543,7 +697,8 @@ def index():
         'usage': {
             'assemble': '''curl -X POST -F "assemblyData={...}" -F "stp_382090006301=@file1.stp" http://localhost:5001/assemble -o assembly.zip''',
             'convert_to_dxf': '''curl -X POST -F "file=@model.stp" -F "views=top,front,right" http://localhost:5001/convert-to-dxf -o model.dxf''',
-            'convert_assembly_to_dxf': '''curl -X POST -F "assemblyData={...}" -F "stp_382090006301=@file1.stp" -F "views=top,front" http://localhost:5001/convert-assembly-to-dxf -o assembly.zip'''
+            'convert_assembly_to_dxf': '''curl -X POST -F "assemblyData={...}" -F "stp_382090006301=@file1.stp" -F "views=top,front" http://localhost:5001/convert-assembly-to-dxf -o assembly.zip''',
+            'merge_dxf': '''curl -X POST -F "assemblyData={...}" -F "dxf_382090006301=@file1.dxf" -F "dxf_656905000800=@file2.dxf" http://localhost:5001/merge-dxf -o assembly.dxf'''
         },
         'compression': {
             'level': 9,
